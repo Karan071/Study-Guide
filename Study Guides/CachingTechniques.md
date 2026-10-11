@@ -30,7 +30,8 @@ Related guide: [Authentication, Authorization & Modern Security Protocols](./Aut
 19. [Redis as a Cache](#19-redis-as-a-cache)
 20. [Cache Security and Isolation](#20-cache-security-and-isolation)
 21. [Production Checklist and Cheat Sheet](#21-production-checklist-and-cheat-sheet)
-22. [Master Resource List](#22-master-resource-list)
+22. [Self-Check Questions](#22-self-check-questions)
+23. [Master Resource List](#23-master-resource-list)
 
 ---
 
@@ -47,7 +48,7 @@ A cache is a performance and load-management layer, not the authoritative source
 | Concurrency | What happens when many requests miss together? | 11 |
 | Data shape | How are entries identified and partitioned? | 12, 13, 20 |
 | HTTP delivery | Which layer may store and reuse a response? | 14, 15, 16 |
-| Operations | How do we know whether caching helps? | 21 |
+| Operations | How do we know whether caching helps? | 21, 22 |
 
 ### Common cache topology
 
@@ -135,7 +136,7 @@ These estimates are only useful if the workload and hit rate are measured at the
 ### Resources
 
 - [AWS Builders' Library: Caching challenges and strategies](https://aws.amazon.com/builders-library/caching-challenges-and-strategies/)
-- [Google Cloud: Caching overview](https://cloud.google.com/architecture/caching)
+- [AWS: Caching best practices](https://aws.amazon.com/caching/best-practices/)
 - [Microsoft: Cache-aside pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside)
 
 ---
@@ -159,6 +160,34 @@ get(key):
 ```
 
 On writes, a common strategy is to update the origin and then invalidate the corresponding cache key. The next read repopulates it.
+
+A concrete version with Redis (Python, `redis-py`):
+
+```python
+import json, random
+
+TTL = 300
+NOT_FOUND = "__nf__"           # sentinel so "missing" is distinct from a cache miss
+
+def get_product(product_id: str):
+    key = f"v1:product:{product_id}"
+    cached = r.get(key)
+    if cached is not None:
+        return None if cached == NOT_FOUND else json.loads(cached)
+
+    row = db.fetch_product(product_id)                     # source of truth
+    if row is None:
+        r.set(key, NOT_FOUND, ex=30)                       # short negative-cache TTL
+        return None
+    r.set(key, json.dumps(row), ex=TTL + random.randint(0, 30))  # jitter spreads expiries
+    return row
+
+def update_product(product_id: str, fields: dict):
+    db.update_product(product_id, fields)                  # commit first
+    r.delete(f"v1:product:{product_id}")                   # then invalidate (delete, not set)
+```
+
+Deleting on write is usually safer than writing the new value into the cache: two concurrent writers that each `SET` can finish in the opposite order from their database commits and leave the older value cached.
 
 ### Engineering blueprint
 
@@ -419,7 +448,18 @@ Real cache products often use approximate or segmented variants rather than exac
 - Set memory limits and observe actual memory overhead, not just serialized payload size.
 - Understand whether the selected policy evicts keys, rejects new writes, or applies both behaviors.
 - Test with a representative key popularity distribution and object size.
-- For Redis, select `maxmemory` and an appropriate `maxmemory-policy` for the workload.
+- For Redis, select `maxmemory` and an appropriate `maxmemory-policy` for the workload:
+
+| Redis policy | Evicts | Use when |
+| --- | --- | --- |
+| `noeviction` (default) | Nothing; writes fail when memory is full | Redis holds data that must not silently disappear |
+| `allkeys-lru` | Any key, least recently used first | General-purpose cache; a good default |
+| `allkeys-lfu` | Any key, least frequently used first | Stable popular set with one-off scans that would pollute LRU |
+| `volatile-lru` / `volatile-lfu` | Only keys with a TTL | Mixing cache keys (with TTL) and persistent keys (without) in one instance |
+| `volatile-ttl` | Keys with a TTL, shortest remaining TTL first | Expiry time is a good proxy for value |
+| `allkeys-random` / `volatile-random` | Random | Uniform access patterns |
+
+A pure cache with `noeviction` left in place will start returning errors on writes when it fills up — a common production surprise.
 
 ### Production pitfalls
 
@@ -467,6 +507,24 @@ Reader: stores old value in cache
 ```
 
 Possible mitigations include per-key coordination, version checks, delayed invalidation, compare-and-set writes, or versioned keys. Each has costs; choose based on the staleness budget and write/read concurrency.
+
+Two practical mitigations:
+
+```text
+Delayed double delete:
+  writer: commit DB -> delete key -> wait ~ (longest read+fill time, e.g. 500 ms) -> delete key again
+  The second delete removes a stale value that a racing reader stored in between.
+  Cheap, but it narrows the window instead of closing it.
+
+Versioned keys (generation counter):
+  read:  gen = cache.get("gen:product:42") or 0
+         value = cache.get(f"product:42:g{gen}")
+  write: commit DB -> cache.incr("gen:product:42")
+  Old entries become unreachable immediately and expire through TTL.
+  Costs one extra lookup per read; useful for invalidating whole groups (e.g. "all of tenant 7").
+```
+
+For tight bounds, store the source row's version or `updated_at` with the cached value and only overwrite when the new version is greater (for example, with a Redis Lua script that compares versions atomically).
 
 ### Production pitfalls
 
@@ -560,6 +618,44 @@ For a loader:
 
 Never let an unbounded number of waiters or origin calls accumulate.
 
+In-process single-flight in Go:
+
+```go
+var group singleflight.Group
+
+func GetUser(ctx context.Context, id string) (*User, error) {
+    if u, ok := cache.Get(id); ok {
+        return u, nil
+    }
+    // All concurrent callers for the same id share one database call.
+    v, err, _ := group.Do(id, func() (any, error) {
+        u, err := db.LoadUser(ctx, id)
+        if err == nil {
+            cache.Set(id, u, 5*time.Minute)
+        }
+        return u, err
+    })
+    if err != nil {
+        return nil, err
+    }
+    return v.(*User), nil
+}
+```
+
+Across replicas, a short-lived Redis lock (`SET lock:key <token> NX PX 5000`) can elect one loader per key; other callers briefly wait and re-check the cache, or serve stale.
+
+Probabilistic early expiration ("XFetch", Vattani et al.) avoids locks entirely. Each reader independently decides to refresh early, with a probability that rises as expiry approaches:
+
+```text
+# delta = how long the last recompute took; beta = 1.0 by default (> 1 refreshes earlier)
+if now - delta * beta * ln(random()) >= expiry:     # ln(random()) is negative, so this adds time
+    recompute and reset the entry
+else:
+    serve cached value
+```
+
+With many readers, one of them usually refreshes slightly before expiry, so the key never goes cold under load.
+
 ### Production pitfalls
 
 - A process-local lock does not coordinate across application replicas.
@@ -579,6 +675,8 @@ Never let an unbounded number of waiters or origin calls accumulate.
 - [Cloudflare: Sometimes I cache](https://blog.cloudflare.com/sometimes-i-cache/) (request coalescing and cache behavior)
 - [AWS Builders' Library: Caching challenges and strategies](https://aws.amazon.com/builders-library/caching-challenges-and-strategies/)
 - [Go: `singleflight` package](https://pkg.go.dev/golang.org/x/sync/singleflight)
+- [Vattani, Chierichetti, Lowenstein: Optimal Probabilistic Cache Stampede Prevention](https://cseweb.ucsd.edu/~avattani/papers/cache_stampede.pdf)
+- [Scaling Memcache at Facebook (NSDI 2013)](https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf) (leases for stampedes and stale sets)
 
 ---
 
@@ -664,7 +762,7 @@ Potential key dimensions include entity ID, tenant, locale, currency, feature/co
 ### Resources
 
 - [Redis: Keyspace and key design](https://redis.io/docs/latest/develop/using-commands/keyspace/)
-- [AWS: Multi-tenant SaaS storage strategies](https://aws.amazon.com/solutions/guidance/multi-tenant-saas-storage-strategies-on-aws/)
+- [AWS Whitepaper: SaaS tenant isolation strategies](https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html)
 
 ---
 
@@ -678,16 +776,35 @@ Important response directives:
 
 | Directive | Meaning (simplified) |
 | --- | --- |
-| `Cache-Control: max-age=N` | Fresh for N seconds in a private cache |
-| `s-maxage=N` | Freshness lifetime for shared caches |
+| `Cache-Control: max-age=N` | Fresh for N seconds in any cache (browser, proxy, CDN) |
+| `s-maxage=N` | Freshness lifetime for shared caches only; overrides `max-age` there |
 | `no-store` | Do not store the response |
 | `no-cache` | May store, but must validate before reuse |
 | `private` | Shared caches must not store this response |
 | `public` | Explicitly permits shared-cache storage where otherwise restricted |
 | `must-revalidate` | Do not reuse stale response without successful validation |
 | `stale-while-revalidate=N` | May serve stale while asynchronously revalidating, within the extension's window |
+| `stale-if-error=N` | May serve stale for up to N seconds if the origin returns an error or is unreachable |
+| `immutable` | The body will never change during its freshness lifetime; skip revalidation even on reload |
 
 Validators such as `ETag` and `Last-Modified` allow conditional requests (`If-None-Match`, `If-Modified-Since`) and `304 Not Modified` responses.
+
+Typical header sets:
+
+```http
+# Fingerprinted static asset: /static/app.3f9a1c.js
+Cache-Control: public, max-age=31536000, immutable
+
+# Public API data that can be a minute stale; CDN may keep it longer and serve stale on errors
+Cache-Control: public, max-age=60, s-maxage=300, stale-while-revalidate=30, stale-if-error=86400
+
+# User-specific page: browser may store but must check with the server each time
+Cache-Control: private, no-cache
+ETag: "u42-v19"
+
+# Sensitive response (bank statement, token endpoint)
+Cache-Control: no-store
+```
 
 ### Engineering blueprint
 
@@ -829,6 +946,7 @@ A distributed cache is accessed by multiple application instances, usually over 
 - Slow cache calls can consume request threads and connection pools.
 - Cross-zone or cross-region network cost can erase the expected latency improvement.
 - Failover may return missing, stale, or differently distributed keys.
+- **Hot keys:** one very popular key (a celebrity profile, a flash-sale item) lives on one shard, so that shard saturates while others idle. Mitigate with a short-TTL in-process near-cache for that key, or by writing replicas `key#0..key#N-1` and reading a random one.
 
 ### SDE best practices
 
@@ -839,7 +957,7 @@ A distributed cache is accessed by multiple application instances, usually over 
 
 ### Resources
 
-- [Google Cloud: Caching overview](https://cloud.google.com/architecture/caching)
+- [AWS: Caching best practices](https://aws.amazon.com/caching/best-practices/)
 - [Redis: Redis Cluster](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)
 - [AWS Builders' Library: Caching challenges and strategies](https://aws.amazon.com/builders-library/caching-challenges-and-strategies/)
 
@@ -895,6 +1013,22 @@ Redis is an in-memory data store often used for shared caching, counters, coordi
 - Clients communicate over a network and must handle timeouts, reconnects, and partial failures.
 - Persistence, replication, and clustering are configurable; none makes every Redis deployment a durable database by default.
 - Client-side caching/tracking can reduce repeated network reads but requires invalidation handling.
+- Licensing note: Redis moved from BSD to source-available licenses in 2024 (version 7.4) and added AGPLv3 as an option in Redis 8 (2025). The Linux Foundation fork **Valkey** stays BSD-licensed and is protocol-compatible; several cloud providers' managed offerings now use it. Commands in this section apply to both.
+
+Commands worth knowing for caching:
+
+| Command | Use |
+| --- | --- |
+| `SET key value EX 300` | Store with a TTL in one atomic step (prefer over `SET` then `EXPIRE`) |
+| `SET lock:key token NX PX 5000` | Set only if absent, with a millisecond TTL; basis for a simple loader lock |
+| `MGET k1 k2 k3` | Read many keys in one round trip |
+| `UNLINK key` | Delete, freeing memory in the background (non-blocking for large values) |
+| `SCAN 0 MATCH v1:product:* COUNT 1000` | Iterate keys incrementally; use instead of `KEYS` in production |
+| `TTL key` | Remaining lifetime in seconds (`-1` = no expiry, `-2` = missing) |
+| `INFO stats` / `INFO memory` | Hit/miss counters (`keyspace_hits`, `keyspace_misses`), evictions, memory use |
+| `redis-cli --bigkeys` / `--hotkeys` | Find oversized keys and popular keys (hotkeys requires an LFU policy) |
+
+Use pipelining (sending many commands without waiting for each reply) when issuing many independent commands; it removes per-command round-trip latency.
 
 ### Engineering blueprint
 
@@ -925,6 +1059,8 @@ Redis is an in-memory data store often used for shared caching, counters, coordi
 - [Redis: Key eviction](https://redis.io/docs/latest/develop/reference/eviction/)
 - [Redis: Key expiration](https://redis.io/docs/latest/commands/expire/)
 - [Redis: Client-side caching](https://redis.io/docs/latest/develop/clients/client-side-caching/)
+- [Redis: SET command options](https://redis.io/docs/latest/commands/set/)
+- [Valkey](https://valkey.io/)
 
 ---
 
@@ -965,7 +1101,7 @@ Caches can expose data across users or tenants when keys, HTTP directives, or in
 
 - [OWASP Web Security Testing Guide: Testing for Web Cache Poisoning](https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/07-Input_Validation_Testing/17-Testing_for_Web_Cache_Poisoning)
 - [RFC 9111: Caching and authenticated responses](https://www.rfc-editor.org/rfc/rfc9111.html)
-- [AWS: Multi-tenant SaaS storage strategies](https://aws.amazon.com/solutions/guidance/multi-tenant-saas-storage-strategies-on-aws/)
+- [AWS Whitepaper: SaaS tenant isolation strategies](https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html)
 
 ---
 
@@ -1054,7 +1190,77 @@ Caches can expose data across users or tenants when keys, HTTP directives, or in
 
 ---
 
-## 22. Master Resource List
+## 22. Self-Check Questions
+
+Try to answer each question before opening the answer.
+
+<details>
+<summary>1. On a write, should you update the cache or delete the key? Why?</summary>
+
+Usually delete. Two concurrent writers that each set the cache can finish in a different order from their database commits and leave the older value cached. Deleting forces the next reader to load the committed value. Update-on-write is reasonable only with version checks.
+</details>
+
+<details>
+<summary>2. Describe the race that can leave stale data in cache-aside even when you delete on write.</summary>
+
+A reader misses and reads the old value from the database. A writer commits the new value and deletes the key. The reader then stores the old value it read. The cache now holds stale data until TTL expiry. Mitigate with a finite TTL, delayed double delete, versioned keys, or version-checked writes.
+</details>
+
+<details>
+<summary>3. What is a cache stampede, and name three ways to prevent it.</summary>
+
+Many requests miss the same popular key at once (often right after expiry) and all hit the origin. Prevent with single-flight / request coalescing, jittered TTLs, stale-while-revalidate, probabilistic early refresh (XFetch), or a short-lived loader lock.
+</details>
+
+<details>
+<summary>4. What is the difference between expiration and eviction?</summary>
+
+Expiration removes an entry because its TTL passed: the data is considered too old. Eviction removes an entry before its TTL because the cache needs memory: the data may still be fresh.
+</details>
+
+<details>
+<summary>5. What does Cache-Control: no-cache mean? How is it different from no-store?</summary>
+
+`no-cache` allows storing the response but requires revalidation with the origin before every reuse. `no-store` forbids storing it at all. Use `no-store` for sensitive data.
+</details>
+
+<details>
+<summary>6. A CDN served one user's account page to another user. What went wrong and how do you prevent it?</summary>
+
+A personalized response was stored in a shared cache, usually because it was marked `public` (or had no directives and the CDN was configured to cache it) and the cache key did not include the user. Mark user-specific responses `private` or `no-store`, keep authenticated routes out of CDN caching rules, and test with two users.
+</details>
+
+<details>
+<summary>7. Why should negative caching use a shorter TTL, and what should never be negatively cached?</summary>
+
+The missing object may be created soon, and a long negative TTL hides it. Never cache transient failures (timeouts, 5xx, connection errors) as "not found": that turns a brief outage into a long one.
+</details>
+
+<details>
+<summary>8. Your Redis cache is full and writes start failing with OOM errors. What is the likely configuration problem?</summary>
+
+`maxmemory-policy` is still the default `noeviction`. For a pure cache, set `allkeys-lru` or `allkeys-lfu` so Redis evicts instead of rejecting writes.
+</details>
+
+<details>
+<summary>9. When is write-behind caching dangerous?</summary>
+
+When the cache acknowledges a write before it is durable in the source of truth. A cache node failure can lose acknowledged writes. Avoid it for money, inventory, and other critical data unless a durable log and recovery process exist.
+</details>
+
+<details>
+<summary>10. Hit rate is 98%, but the database still falls over during deploys. Why?</summary>
+
+Deploys restart in-process caches or flush shared ones, so the hit rate drops to near zero at once and the full request load hits the database (cold start). Warm caches before shifting traffic, roll out gradually, avoid global flushes, and size the origin (or limit concurrency to it) for the cache-loss case.
+</details>
+
+<details>
+<summary>11. What must a cache key include in a multi-tenant system?</summary>
+
+Every input that changes the result: tenant ID, and user or permission scope when results differ by caller, plus locale, currency, feature flags, query parameters, and a schema version. Missing the tenant ID is a data-leak bug, not just a correctness bug.
+</details>
+
+## 23. Master Resource List
 
 ### HTTP standards
 
@@ -1071,10 +1277,10 @@ Caches can expose data across users or tenants when keys, HTTP directives, or in
 | Topic | Link |
 | --- | --- |
 | Caching challenges and strategies | [AWS Builders' Library](https://aws.amazon.com/builders-library/caching-challenges-and-strategies/) |
-| Caching overview | [Google Cloud Architecture Center](https://cloud.google.com/architecture/caching) |
+| Caching best practices | [AWS](https://aws.amazon.com/caching/best-practices/) |
 | Cache-aside pattern | [Microsoft Azure Architecture Center](https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside) |
 | Transactional outbox pattern | [AWS Prescriptive Guidance](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html) |
-| Multi-tenant SaaS storage strategies | [AWS Guidance](https://aws.amazon.com/solutions/guidance/multi-tenant-saas-storage-strategies-on-aws/) |
+| SaaS tenant isolation strategies | [AWS Whitepaper](https://docs.aws.amazon.com/whitepapers/latest/saas-tenant-isolation-strategies/saas-tenant-isolation-strategies.html) |
 
 ### Product and implementation documentation
 

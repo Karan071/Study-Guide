@@ -26,7 +26,8 @@ This guide uses simple language for technical ideas. An **API** (Application Pro
 15. [Observability and Reliability](#15-observability-and-reliability)
 16. [Choosing REST, GraphQL, or gRPC](#16-choosing-rest-graphql-or-grpc)
 17. [Production Checklist](#17-production-checklist)
-18. [Master Resource List](#18-master-resource-list)
+18. [Self-Check Questions](#18-self-check-questions)
+19. [Master Resource List](#19-master-resource-list)
 
 ## 0. API System Map
 
@@ -160,6 +161,35 @@ The path should identify the resource. The method should express the operation. 
 - Use `PATCH` for partial updates and `PUT` when replacing the full representation is intended.
 - Keep business rules on the server; the client requests an operation but does not dictate internal processing.
 
+### Actions that do not fit CRUD
+
+Some operations are state transitions, not field edits. Model them as a sub-resource or a custom action rather than letting clients `PATCH` a `status` field directly, so the server can enforce the transition rules:
+
+```text
+POST /v1/orders/ord_123/cancel        # custom action (Google AIP-136 style: /orders/ord_123:cancel)
+POST /v1/orders/ord_123/refunds       # create a refund resource
+```
+
+### Long-running operations
+
+If work takes longer than a normal request timeout (exports, video processing, bulk imports), accept the request and return an operation resource the client can poll:
+
+```http
+POST /v1/exports
+→ 202 Accepted
+Location: /v1/operations/op_789
+
+GET /v1/operations/op_789
+→ 200 OK
+{"id": "op_789", "status": "running", "progress": 0.4}
+
+GET /v1/operations/op_789
+→ 200 OK
+{"id": "op_789", "status": "succeeded", "result": {"url": "/v1/exports/exp_55"}}
+```
+
+Document the possible states (`pending`, `running`, `succeeded`, `failed`, `cancelled`), how long operation records are kept, and whether a webhook is sent on completion so clients do not have to poll.
+
 ### Production pitfalls
 
 - Creating a different URL or response style for every resource.
@@ -179,6 +209,8 @@ The path should identify the resource. The method should express the operation. 
 - [Fielding dissertation: Architectural Styles and the Design of Network-based Software Architectures](https://ics.uci.edu/~fielding/pubs/dissertation/top.htm)
 - [Microsoft REST API Guidelines](https://github.com/microsoft/api-guidelines)
 - [Google AIP-121: Resource-oriented design](https://google.aip.dev/121)
+- [Google AIP-136: Custom methods](https://google.aip.dev/136)
+- [Google AIP-151: Long-running operations](https://google.aip.dev/151)
 
 ## 3. HTTP Methods and Idempotency
 
@@ -211,6 +243,47 @@ Content-Type: application/json
 
 The server should associate the key with the authenticated caller, operation, and request result for a documented retention period. A repeated key with the same request should return the original outcome rather than performing the action again. A repeated key with a different request should be rejected.
 
+A minimal server-side implementation:
+
+```text
+idempotency_keys(
+  caller_id, key,               -- unique together
+  request_hash,                 -- hash of method + path + body
+  status,                       -- in_progress | completed
+  response_code, response_body,
+  created_at                    -- used for expiry, e.g. 24 hours
+)
+
+on request(caller, key, req):
+  row = insert (caller, key, hash(req), 'in_progress') on conflict do nothing
+  if insert succeeded:
+      result = execute(req)            -- same DB transaction as the row update where possible
+      update row set status='completed', response=result
+      return result
+  existing = select row
+  if existing.request_hash != hash(req): return 422 (key reused with different request)
+  if existing.status == 'in_progress':  return 409 (retry later)
+  return existing.response             -- replay the original outcome
+```
+
+### Optimistic concurrency with `ETag` and `If-Match`
+
+Two clients can read the same resource and both try to update it; without a check, the second write silently overwrites the first ("lost update"). Use the resource version as a precondition:
+
+```http
+GET /v1/books/42
+→ 200 OK
+ETag: "v7"
+
+PATCH /v1/books/42
+If-Match: "v7"
+Content-Type: application/merge-patch+json
+
+{"title": "New title"}
+```
+
+If the stored version is still `v7`, the server applies the change and returns the new `ETag`. If another client already changed it, the server returns `412 Precondition Failed`, and the client re-reads and retries. In SQL this is often a single conditional update: `UPDATE books SET ..., version = version + 1 WHERE id = 42 AND version = 7`, then checking that one row was affected.
+
 ### Production pitfalls
 
 - Automatically retrying non-idempotent operations and creating duplicate payments, orders, or messages.
@@ -229,6 +302,9 @@ The server should associate the key with the authenticated caller, operation, an
 
 - [RFC 9110: Safe and Idempotent Methods](https://www.rfc-editor.org/rfc/rfc9110#section-9.2)
 - [RFC 5789: PATCH Method](https://www.rfc-editor.org/rfc/rfc5789)
+- [RFC 7396: JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396)
+- [IETF draft: The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/)
+- [Stripe: Designing robust and predictable APIs with idempotency](https://stripe.com/blog/idempotency)
 
 ## 4. Status Codes and Error Responses
 
@@ -246,12 +322,18 @@ Status codes give clients a standard, broad description of what happened. Use th
 | `401 Unauthorized` | Authentication is missing or invalid | Missing, expired, or invalid credentials |
 | `403 Forbidden` | Caller is not allowed | Authenticated caller lacks permission |
 | `404 Not Found` | Resource was not found or is not disclosed | Missing resource |
+| `405 Method Not Allowed` | Resource exists but does not support this method | `DELETE` on a read-only resource; include an `Allow` header |
 | `409 Conflict` | Request conflicts with current state | Duplicate or incompatible state transition |
 | `412 Precondition Failed` | A request precondition failed | Conditional update using `If-Match` |
+| `415 Unsupported Media Type` | Server cannot process the request body's format | Client sent XML or form data where JSON is required |
 | `422 Unprocessable Content` | Content is understood but cannot be processed | Semantic validation failure, if used consistently |
 | `429 Too Many Requests` | Client exceeded a limit | Rate or quota limit |
 | `500 Internal Server Error` | Unexpected server failure | Generic server-side failure |
+| `502 Bad Gateway` | A gateway or proxy got an invalid response upstream | Upstream service crashed or closed the connection |
 | `503 Service Unavailable` | Service temporarily cannot handle request | Overload or planned temporary unavailability |
+| `504 Gateway Timeout` | A gateway or proxy did not get a response in time | Upstream service exceeded the gateway timeout |
+
+A quick rule for clients: `4xx` means "change the request before retrying" (except `408`, `429`, and sometimes `409`); `5xx` means "the server failed" and the request may be retried if the operation is idempotent or carries an idempotency key.
 
 `401` and `403` are different: `401` means the request lacks valid authentication; `403` means the identity is known but the action is not allowed. An API may return `404` instead of `403` when revealing that a protected object exists would expose sensitive information.
 
@@ -425,6 +507,21 @@ Example response:
 }
 ```
 
+Cursor pagination is usually implemented as **keyset pagination**. The cursor encodes the sort key of the last item returned, and the next query starts after it:
+
+```sql
+-- Offset: the database still reads and discards the first 10,000 rows.
+SELECT * FROM books ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 10000;
+
+-- Keyset: an index on (created_at, id) lets the database seek directly to the position.
+SELECT * FROM books
+WHERE (created_at, id) < (:last_created_at, :last_id)
+ORDER BY created_at DESC, id DESC
+LIMIT 21;   -- fetch one extra row to compute has_more
+```
+
+Encode `(last_created_at, last_id)` into the cursor (for example, base64 JSON, optionally signed) so clients treat it as opaque. Row-value comparison is supported by PostgreSQL and MySQL; other databases may need the expanded form `created_at < ? OR (created_at = ? AND id < ?)`.
+
 ### Engineering blueprint
 
 - Set a default page size and a maximum page size.
@@ -451,6 +548,7 @@ Example response:
 
 - [Google AIP-158: Pagination](https://google.aip.dev/158)
 - [JSON:API pagination](https://jsonapi.org/format/#fetching-pagination)
+- [Use The Index, Luke: Paging through results without OFFSET](https://use-the-index-luke.com/no-offset)
 
 ## 8. API Contracts and OpenAPI
 
@@ -522,6 +620,17 @@ Common versioning approaches include:
 
 No approach removes the need to communicate changes. Choose a strategy and apply it consistently.
 
+Signal deprecation in responses so clients can detect it automatically:
+
+```http
+HTTP/1.1 200 OK
+Deprecation: @1767225600
+Sunset: Wed, 30 Jun 2027 23:59:59 GMT
+Link: <https://api.example.com/docs/migrate-v2>; rel="deprecation"
+```
+
+`Deprecation` (RFC 9745) says when the resource was or will be deprecated, as a Unix timestamp. `Sunset` (RFC 8594) says when it may stop responding.
+
 ### Engineering blueprint
 
 - Define compatibility rules before the API has many clients.
@@ -548,6 +657,7 @@ No approach removes the need to communicate changes. Choose a strategy and apply
 
 - [Google AIP-180: Backwards compatibility](https://google.aip.dev/180)
 - [RFC 8594: The Sunset HTTP Header](https://www.rfc-editor.org/rfc/rfc8594)
+- [RFC 9745: The Deprecation HTTP Response Header Field](https://www.rfc-editor.org/rfc/rfc9745)
 
 ## 10. API Security
 
@@ -594,7 +704,7 @@ Use defense in depth:
 ### Resources
 
 - [OWASP API Security Top 10](https://owasp.org/API-Security/)
-- [OWASP API Security Project](https://owasp.org/www-project-api-security/)
+- [OWASP API Security Top 10 (2023 edition)](https://owasp.org/API-Security/editions/2023/en/0x11-t10/)
 - [OWASP Cheat Sheet Series](https://cheatsheetseries.owasp.org/)
 
 ## 11. Rate Limits and Resource Protection
@@ -605,7 +715,44 @@ Rate limiting controls how frequently a client can call an API. It helps protect
 
 A limit may be applied per account, API key, user, IP address, tenant, or endpoint. Use the identity that best matches the risk; IP-only limits can affect many legitimate users behind the same network.
 
-When a client exceeds a limit, return `429 Too Many Requests`. If useful, include `Retry-After` to tell the client when to try again. Some APIs also return documented limit and reset headers.
+When a client exceeds a limit, return `429 Too Many Requests`. If useful, include `Retry-After` to tell the client when to try again. Some APIs also return documented limit and reset headers; a standard `RateLimit` / `RateLimit-Policy` header format is being developed by the IETF but is still a draft.
+
+Common algorithms:
+
+| Algorithm | How it works | Trade-off |
+| --- | --- | --- |
+| Fixed window | Count requests per clock window (for example, per minute) | Simple; allows a burst of 2x at window boundaries |
+| Sliding window | Weight the previous window's count by how much of it overlaps | Smoother; slightly more state |
+| Token bucket | Tokens refill at a steady rate up to a capacity; each request spends one | Allows controlled bursts; the most common choice |
+| Leaky bucket | Requests drain from a queue at a fixed rate | Smooth output rate; adds queueing delay |
+
+Token bucket in pseudocode:
+
+```text
+capacity = 100            # maximum burst
+refill_rate = 10          # tokens per second
+
+on request(client):
+  b = buckets[client]
+  now = clock()
+  b.tokens = min(capacity, b.tokens + (now - b.last) * refill_rate)
+  b.last = now
+  if b.tokens >= 1:
+      b.tokens -= 1
+      allow
+  else:
+      reject 429, Retry-After = ceil((1 - b.tokens) / refill_rate)
+```
+
+In a multi-instance service, keep the bucket in a shared store (for example, Redis with an atomic Lua script) or enforce the limit at the gateway.
+
+Client retry delay with exponential backoff and "full jitter":
+
+```text
+delay = random(0, min(max_delay, base_delay * 2^attempt))
+```
+
+The randomness stops many clients that failed at the same moment from retrying at the same moment.
 
 ### Engineering blueprint
 
@@ -632,7 +779,8 @@ When a client exceeds a limit, return `429 Too Many Requests`. If useful, includ
 ### Resources
 
 - [RFC 6585: 429 Too Many Requests](https://www.rfc-editor.org/rfc/rfc6585#section-4)
-- [RFC 9333: RateLimit Fields for HTTP](https://www.rfc-editor.org/rfc/rfc9333)
+- [IETF draft: RateLimit header fields for HTTP](https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/)
+- [AWS Builders' Library: Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)
 
 ## 12. Caching
 
@@ -706,6 +854,22 @@ Webhook delivery is commonly **at least once**: a provider retries when it does 
 - Store or enqueue the event durably before returning success.
 - Make event handling idempotent using the event ID.
 - Document retry schedules, timeout expectations, event ordering, and how to replay events.
+
+Receiver-side signature check (Python sketch; header names vary by provider):
+
+```python
+import hmac, hashlib, time
+
+def verify(raw_body: bytes, timestamp: str, signature: str, secret: bytes) -> bool:
+    # Reject old deliveries to limit replay attacks.
+    if abs(time.time() - int(timestamp)) > 300:
+        return False
+    signed = timestamp.encode() + b"." + raw_body          # sign the raw bytes, not re-serialized JSON
+    expected = hmac.new(secret, signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)        # constant-time comparison
+```
+
+After verification, insert the event ID into a table with a unique constraint. If the insert fails because the ID already exists, the event is a duplicate: return `2xx` and skip processing.
 
 ### Production pitfalls
 
@@ -888,7 +1052,71 @@ These styles can coexist. For example, a company may expose REST to partners and
 - [ ] Alerts cover user-visible service objectives.
 - [ ] API changes have a safe rollout and rollback plan.
 
-## 18. Master Resource List
+## 18. Self-Check Questions
+
+Try to answer each question before opening the answer.
+
+<details>
+<summary>1. What is the difference between a safe method and an idempotent method? Give an example that is idempotent but not safe.</summary>
+
+A safe method does not ask the server to change state (`GET`, `HEAD`). An idempotent method has the same intended effect whether it runs once or many times. `PUT` and `DELETE` are idempotent but not safe: they change state, but repeating them does not change it further.
+</details>
+
+<details>
+<summary>2. A client's payment request times out. Why is retrying dangerous, and how do you make it safe?</summary>
+
+The server may have charged the card before the connection failed, so a blind retry can charge twice. The client sends an `Idempotency-Key`; the server stores the key with the result and returns the stored result on a retry instead of charging again.
+</details>
+
+<details>
+<summary>3. When do you return 401, 403, and 404 for a protected resource?</summary>
+
+`401` when credentials are missing or invalid. `403` when the caller is authenticated but not allowed. `404` instead of `403` when revealing that the resource exists would leak information, for example another tenant's order ID.
+</details>
+
+<details>
+<summary>4. Why does offset pagination get slow and inconsistent on large tables, and what replaces it?</summary>
+
+The database must read and discard every skipped row, so cost grows with the offset. Inserts or deletes between page requests shift rows, causing duplicates or gaps. Keyset (cursor) pagination filters on the last-seen sort key with an index, so each page costs about the same and is stable under inserts.
+</details>
+
+<details>
+<summary>5. What is BOLA/IDOR and how do you prevent it?</summary>
+
+Broken Object Level Authorization: the API checks that the caller is logged in but not that the caller may access the specific object ID in the request. Prevent it by loading the object and checking ownership or permissions against the authenticated principal on every request, and by testing with two different users.
+</details>
+
+<details>
+<summary>6. Two users edit the same record at the same time. How do you avoid the lost-update problem?</summary>
+
+Optimistic concurrency: return a version in an `ETag`, require `If-Match` on updates, and apply the update only if the stored version matches. Otherwise return `412 Precondition Failed` so the client can re-read and retry.
+</details>
+
+<details>
+<summary>7. Which of these changes are breaking: adding a response field, adding a required request field, renaming a field, adding an enum value?</summary>
+
+Adding a required request field and renaming a field are breaking. Adding a response field is usually safe if clients ignore unknown fields. Adding an enum value can break clients that use exhaustive matching, so document that clients must handle unknown values.
+</details>
+
+<details>
+<summary>8. Why is webhook delivery "at least once", and what must the receiver do about it?</summary>
+
+The provider cannot tell whether a timed-out delivery was processed, so it retries. The receiver must deduplicate by event ID, acknowledge quickly after durably storing the event, and not assume ordering.
+</details>
+
+<details>
+<summary>9. Why add jitter to exponential backoff?</summary>
+
+Without jitter, clients that failed together retry together, producing synchronized load spikes that can keep the server overloaded. Random delays spread retries out.
+</details>
+
+<details>
+<summary>10. When would you pick gRPC over REST, and what do you lose?</summary>
+
+For internal service-to-service calls that need typed contracts, streaming, and efficient binary encoding. You lose easy browser access and human-readable payloads, so public or browser-facing APIs usually stay REST/JSON or go through a gateway.
+</details>
+
+## 19. Master Resource List
 
 ### HTTP and API design
 

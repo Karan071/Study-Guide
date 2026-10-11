@@ -7,7 +7,7 @@ Last reviewed: 2026-10-12.
 
 Code is TypeScript unless noted. The concurrency section uses Java, because LLD interviews often ask about threads and TypeScript is single-threaded. All patterns carry over directly to Java, Python, Go, and C++.
 
-Related guides in this repo: [Caching Techniques](./CachingTechniques.md), [APIs](./APIs.md), [Backend Optimization](./BackendOptmization.md), [Authentication](./AuthenticationConcepts.md), [Docker & Kubernetes](./DockerKubernates.md).
+Related guides in this repo: [Caching Techniques](./CachingTechniques.md), [APIs](./APIs.md), [Backend Optimization](./BackendOptimization.md), [Authentication](./AuthenticationConcepts.md), [Docker & Kubernetes](./DockerKubernetes.md).
 
 ## Table of Contents
 

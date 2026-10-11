@@ -30,7 +30,8 @@ Related guides: [Authentication, Authorization & Modern Security Protocols](./Au
 19. [Security: Images, Containers, and Clusters](#19-security-images-containers-and-clusters)
 20. [Observability and Troubleshooting](#20-observability-and-troubleshooting)
 21. [Production Checklist and Cheat Sheet](#21-production-checklist-and-cheat-sheet)
-22. [Master Resource List](#22-master-resource-list)
+22. [Self-Check Questions](#22-self-check-questions)
+23. [Master Resource List](#23-master-resource-list)
 
 ---
 
@@ -199,14 +200,14 @@ A Dockerfile describes instructions for building an image. A reliable Dockerfile
 ### Engineering blueprint
 
 ```dockerfile
-FROM node:22-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS runtime
+FROM node:24-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build --chown=node:node /app/package*.json ./
@@ -218,6 +219,18 @@ CMD ["node", "dist/server.js"]
 ```
 
 The exact build and runtime commands depend on the application. Keep the final stage limited to runtime dependencies and required artifacts.
+
+Shell form vs exec form, the most common signal-handling bug:
+
+```dockerfile
+CMD node dist/server.js            # shell form: runs /bin/sh -c "...", sh is PID 1,
+                                   # SIGTERM goes to sh and often never reaches node
+CMD ["node", "dist/server.js"]     # exec form: node is PID 1 and receives SIGTERM directly
+```
+
+`ENTRYPOINT` vs `CMD`: `ENTRYPOINT` is the fixed executable; `CMD` supplies default arguments that `docker run image <args>` replaces. With `ENTRYPOINT ["python", "app.py"]` and `CMD ["--port", "8080"]`, running `docker run image --port 9090` executes `python app.py --port 9090`.
+
+Docker's `HEALTHCHECK` instruction is used by `docker run` and Compose, but **Kubernetes ignores it**; define probes in the Pod spec instead (see section 15).
 
 ### Production pitfalls
 
@@ -310,6 +323,22 @@ docker stop example-api
 - `-p` publishes a host port to a container port.
 - `--rm` removes the container after it exits.
 - `docker stop` sends a termination signal and eventually force-kills after its grace period.
+
+Everyday Docker commands:
+
+| Need | Command |
+| --- | --- |
+| List running / all containers | `docker ps` / `docker ps -a` |
+| Shell into a running container | `docker exec -it NAME sh` |
+| Follow logs | `docker logs -f --tail 100 NAME` |
+| Inspect config, mounts, network, exit code | `docker inspect NAME` |
+| Live CPU / memory per container | `docker stats` |
+| Show image layers and their sizes | `docker history IMAGE` |
+| Set resource limits | `docker run --memory 512m --cpus 1 IMAGE` |
+| Build for another CPU architecture | `docker buildx build --platform linux/amd64,linux/arm64 -t IMAGE --push .` |
+| Reclaim disk space | `docker system df`, then `docker system prune` (removes stopped containers, unused networks, dangling images) |
+
+Exit codes you will see: `0` clean exit; `1` application error; `125`–`127` Docker or command-not-found problems; `137` = 128 + 9 (SIGKILL, often an out-of-memory kill or a forced stop); `143` = 128 + 15 (SIGTERM, normal stop).
 
 ### Engineering blueprint
 
@@ -588,6 +617,18 @@ spec:
 
 Direct Pod manifests are useful for learning and diagnostics. Production stateless applications generally belong in a `Deployment`, which manages Pods.
 
+Choosing a workload controller:
+
+| Controller | Use for | Example |
+| --- | --- | --- |
+| `Deployment` | Stateless, interchangeable replicas | Web APIs, frontends, stateless workers |
+| `StatefulSet` | Stable names, ordered startup, per-replica storage | Databases, Kafka, ZooKeeper, Elasticsearch |
+| `DaemonSet` | Exactly one Pod per node (or per matching node) | Log shippers, node monitoring agents, CNI plugins |
+| `Job` | Run to completion, with retries | Database migration, one-off batch processing |
+| `CronJob` | `Job` on a schedule | Nightly reports, cleanup tasks |
+
+Since Kubernetes v1.33, **native sidecar containers** are stable: declare a helper in `initContainers` with `restartPolicy: Always`. It starts before the app containers, keeps running alongside them, and stops after them. This fixes old problems such as a log or proxy sidecar exiting before the main app finished, or a `Job` never completing because its sidecar kept running.
+
 ### Production pitfalls
 
 - Storing a Pod IP in configuration breaks when the Pod is replaced.
@@ -607,6 +648,7 @@ Direct Pod manifests are useful for learning and diagnostics. Production statele
 - [Kubernetes: Pods](https://kubernetes.io/docs/concepts/workloads/pods/)
 - [Kubernetes: Init containers](https://kubernetes.io/docs/concepts/workloads/pods/init-containers/)
 - [Kubernetes: Sidecar containers](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/)
+- [Kubernetes: Jobs](https://kubernetes.io/docs/concepts/workloads/controllers/job/), [CronJobs](https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/), [DaemonSets](https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/)
 
 ---
 
@@ -654,6 +696,43 @@ spec:
 
 The selector must match the template labels and should be treated as stable identity.
 
+Three replicas do not give high availability if the scheduler puts them on the same node, and a node drain can take them all down at once. Add spread constraints and a disruption budget:
+
+```yaml
+# In the Deployment's Pod template spec:
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 2          # voluntary disruptions (node drains, upgrades) must leave 2 Pods running
+  selector:
+    matchLabels:
+      app: api
+```
+
+A PodDisruptionBudget protects only against **voluntary** disruptions such as `kubectl drain` and cluster upgrades. It does not prevent node crashes.
+
+Useful rollout commands:
+
+```bash
+kubectl set image deployment/api api=registry.example.com/team/api@sha256:NEW_DIGEST
+kubectl rollout status deployment/api       # wait for success or failure
+kubectl rollout history deployment/api      # list revisions
+kubectl rollout undo deployment/api         # go back one revision
+kubectl rollout restart deployment/api      # recreate Pods, e.g. to pick up changed Secrets
+```
+
+Rolling updates are the built-in strategy. Blue-green (run the new version alongside the old, then switch the Service selector) and canary (send a small share of traffic to the new version, then increase it) need either two Deployments or a tool such as Argo Rollouts, Flagger, or a service mesh.
+
 ### Production pitfalls
 
 - A rollout can stall when new Pods fail readiness, cannot pull images, or cannot schedule.
@@ -673,6 +752,8 @@ The selector must match the template labels and should be treated as stable iden
 - [Kubernetes: Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
 - [kubectl: `rollout`](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_rollout/)
 - [Kubernetes: Rolling updates](https://kubernetes.io/docs/tutorials/kubernetes-basics/update/update-intro/)
+- [Kubernetes: Disruptions and PodDisruptionBudgets](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/)
+- [Kubernetes: Topology spread constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/)
 
 ---
 
@@ -740,6 +821,32 @@ Ingress and Gateway APIs describe HTTP/TCP routing from outside a cluster to Ser
 - Controllers integrate with cloud load balancers, proxies, certificates, and policy systems.
 - TLS termination can occur at the edge, at an in-cluster proxy, or end-to-end depending on design.
 
+**Status in 2026:** the Ingress API is stable but frozen; new features go into Gateway API. The widely used community **ingress-nginx** controller was retired: best-effort maintenance ended in March 2026, and it no longer receives releases or security fixes. Existing installs keep working, but plan a migration to a maintained Gateway API implementation or another supported controller.
+
+A Gateway API route:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: api
+spec:
+  parentRefs:
+    - name: public-gateway          # Gateway owned by the platform team
+  hostnames:
+    - api.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: api                 # the Service from section 12
+          port: 80
+```
+
+The platform team owns the `Gateway` (listeners, TLS certificates, load balancer); application teams own `HTTPRoute` objects in their own namespaces. Ingress puts all of this in one object.
+
 ### Engineering blueprint
 
 - Select a maintained controller supported by the platform.
@@ -765,6 +872,7 @@ Ingress and Gateway APIs describe HTTP/TCP routing from outside a cluster to Ser
 
 - [Kubernetes: Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/)
 - [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/)
+- [Kubernetes Blog: Ingress NGINX Retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/)
 - [Kubernetes: Service types](https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types)
 
 ---
@@ -779,6 +887,27 @@ Configuration should vary by environment without requiring a different applicati
 - Environment variables are fixed for a running process; changing the source object does not automatically restart the process.
 - Mounted projected files may update eventually, but application reload behavior is separate.
 - Secrets are base64-encoded in manifests by default, not thereby encrypted.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+data:
+  LOG_LEVEL: info
+  FEATURE_X_ENABLED: "true"
+---
+# In the container spec:
+envFrom:
+  - configMapRef:
+      name: api-config               # every key becomes an environment variable
+env:
+  - name: DATABASE_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: api-db                 # Secret created by your secret-management tooling
+        key: password
+```
 
 ### Engineering blueprint
 
@@ -849,6 +978,31 @@ livenessProbe:
 
 The endpoint behavior must match its purpose. Readiness may check dependencies necessary to serve traffic; liveness should generally test whether the process can make progress, not whether every dependency is reachable.
 
+### Graceful shutdown sequence
+
+When a Pod is deleted (rollout, scale-down, node drain), two things start **in parallel**:
+
+```text
+1. kubelet: run preStop hook (if any) -> send SIGTERM -> wait up to terminationGracePeriodSeconds (default 30) -> SIGKILL
+2. control plane: remove the Pod from Service EndpointSlices -> kube-proxy / load balancers stop routing to it
+```
+
+Because step 2 takes time to propagate, a Pod that exits immediately on `SIGTERM` can still receive new requests for a moment, and those requests fail. The usual fix:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 45
+  containers:
+    - name: api
+      lifecycle:
+        preStop:
+          sleep:
+            seconds: 10        # keep serving while endpoints are removed (needs v1.30+;
+                               # older clusters use exec: ["sleep", "10"], which requires sleep in the image)
+```
+
+Then the application, on `SIGTERM`, stops accepting new connections, finishes in-flight requests, closes DB connections, and exits. The preStop time plus the app's drain time must fit inside `terminationGracePeriodSeconds`.
+
 ### Production pitfalls
 
 - A liveness probe that depends on a shared database can restart every replica during a database outage.
@@ -867,6 +1021,7 @@ The endpoint behavior must match its purpose. Readiness may check dependencies n
 
 - [Kubernetes: Liveness, Readiness, and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
 - [Kubernetes: Pod lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- [Kubernetes: Container lifecycle hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
 
 ---
 
@@ -895,6 +1050,21 @@ resources:
 
 These are examples only. Derive values from representative load tests, production metrics, startup peaks, and runtime behavior.
 
+CPU and memory behave differently when a limit is reached:
+
+- **CPU is compressible.** At the limit, the container is throttled (made to wait), so it gets slower but keeps running. `250m` means 0.25 of a core.
+- **Memory is not compressible.** At the limit, the kernel kills the process (`OOMKilled`, exit code 137).
+
+Common practice: set memory request equal to memory limit (predictable, no surprise kills from overcommit), and set a CPU request but consider omitting the CPU limit for latency-sensitive services so they can use idle CPU instead of being throttled. Some platform teams require CPU limits for fairness; check your cluster's policy.
+
+The request/limit settings decide the Pod's **QoS class**, which determines who is evicted first when a node runs short of memory:
+
+| QoS class | Condition | Eviction order |
+| --- | --- | --- |
+| `Guaranteed` | Every container has CPU and memory requests equal to limits | Last |
+| `Burstable` | At least one request or limit set, but not Guaranteed | Middle |
+| `BestEffort` | No requests or limits at all | First |
+
 ### Production pitfalls
 
 - Requests that are too high waste capacity and leave Pods Pending.
@@ -915,6 +1085,7 @@ These are examples only. Derive values from representative load tests, productio
 - [Kubernetes: Manage resources for containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
 - [Kubernetes: Assign memory resources](https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/)
 - [Kubernetes: Assign CPU resources](https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/)
+- [Kubernetes: Pod Quality of Service classes](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/)
 
 ---
 
@@ -937,6 +1108,34 @@ Autoscaling adjusts workload replicas or cluster nodes based on observed or pred
 - Account for cold start, image-pull time, cache warming, and downstream capacity.
 - Load-test scaling lag and metric failure behavior.
 
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70      # percent of the CPU *request*, not of the node
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300 # wait 5 minutes of lower load before removing Pods
+```
+
+The HPA's core formula is `desired = ceil(current_replicas × current_metric / target_metric)`. With 4 replicas at 105% CPU and a 70% target: `ceil(4 × 105 / 70) = 6` replicas.
+
+For queue workers, CPU is often the wrong signal; scale on queue length or message age instead, for example with **KEDA**, which feeds external metrics (Kafka lag, SQS depth, Prometheus queries) to the HPA and can scale to zero.
+
 ### Production pitfalls
 
 - HPA cannot scale from CPU utilization meaningfully when requests are missing or unrealistic.
@@ -957,6 +1156,7 @@ Autoscaling adjusts workload replicas or cluster nodes based on observed or pred
 - [Kubernetes: Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
 - [Kubernetes: HPA concepts](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)
 - [Kubernetes: Node autoscaling](https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/)
+- [KEDA: Kubernetes Event-driven Autoscaling](https://keda.sh/)
 
 ---
 
@@ -1024,6 +1224,63 @@ securityContext:
 
 Some applications need writable temporary directories or specific capabilities; grant only the required access. Pod- and container-level security settings interact, so validate against cluster policy and application behavior.
 
+By default, every Pod can talk to every other Pod in the cluster. Start each namespace with a default-deny policy, then allow only the required paths:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}            # all Pods in this namespace
+  policyTypes: ["Ingress"]   # no ingress rules listed = deny all inbound
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-to-db
+spec:
+  podSelector:
+    matchLabels:
+      app: db
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - port: 5432
+```
+
+If you also deny egress, remember to allow DNS (UDP/TCP 53 to the cluster DNS Pods), or every name lookup will fail.
+
+Least-privilege RBAC for a workload that only needs to read ConfigMaps in its namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: read-config
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: api-read-config
+subjects:
+  - kind: ServiceAccount
+    name: api
+roleRef:
+  kind: Role
+  name: read-config
+  apiGroup: rbac.authorization.k8s.io
+```
+
+Set `automountServiceAccountToken: false` on Pods that do not call the Kubernetes API at all.
+
 ### Production pitfalls
 
 - `privileged: true`, host networking, host PID, and broad hostPath mounts weaken isolation significantly.
@@ -1078,6 +1335,28 @@ kubectl rollout status deployment/my-api -n my-namespace
 
 For a stuck Pod, check status, events, node capacity, image pull errors, volume attach state, and probe failures before changing the manifest.
 
+Common Pod states and what to check:
+
+| Status / reason | Usual meaning | First things to check |
+| --- | --- | --- |
+| `Pending` | Not scheduled yet | `kubectl describe pod` events: insufficient CPU/memory, unmatched node selector or affinity, taints, unbound PVC, volume in another zone |
+| `ImagePullBackOff` / `ErrImagePull` | Node cannot pull the image | Typo in image name or tag, missing `imagePullSecrets`, registry auth or network, wrong architecture |
+| `CreateContainerConfigError` | Container spec references something missing | Missing ConfigMap, Secret, or key referenced by `env` / `envFrom` |
+| `CrashLoopBackOff` | Container starts and keeps exiting; restarts back off exponentially | `kubectl logs POD --previous`, exit code in `describe`, missing config, failing liveness probe, app crash on start |
+| `OOMKilled` (exit 137) | Exceeded its memory limit | Memory limit vs actual usage, leaks, JVM/Node heap settings that ignore the container limit |
+| `Running` but `0/1 READY` | Readiness probe failing | Probe path and port, dependency the readiness check needs, startup time |
+| `Terminating` for a long time | Shutdown or cleanup blocked | App ignoring SIGTERM, long grace period, finalizers on the object, unreachable node |
+| `Evicted` | Node ran short of memory or disk | Node pressure conditions, Pod QoS class, ephemeral storage use (logs, `/tmp`) |
+
+Debugging minimal images that have no shell:
+
+```bash
+kubectl debug -it POD --image=busybox:1.37 --target=api     # ephemeral container sharing the app's process namespace
+kubectl debug node/NODE -it --image=busybox:1.37            # shell on a node (host filesystem mounted at /host)
+kubectl port-forward svc/api 8080:80                        # call a ClusterIP Service from your laptop
+kubectl run tmp --rm -it --image=busybox:1.37 -- nslookup api.my-namespace.svc   # test DNS from inside the cluster
+```
+
 ### Production pitfalls
 
 - Logs may disappear with a Pod unless shipped off-node.
@@ -1096,6 +1375,7 @@ For a stuck Pod, check status, events, node capacity, image pull errors, volume 
 ### Resources
 
 - [Kubernetes: Debugging applications](https://kubernetes.io/docs/tasks/debug/)
+- [Kubernetes: Debug running Pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/)
 - [Kubernetes: Logging architecture](https://kubernetes.io/docs/concepts/cluster-administration/logging/)
 - [Kubernetes: Monitoring](https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-usage-monitoring/)
 - [OpenTelemetry documentation](https://opentelemetry.io/docs/)
@@ -1178,7 +1458,83 @@ For a stuck Pod, check status, events, node capacity, image pull errors, volume 
 
 ---
 
-## 22. Master Resource List
+## 22. Self-Check Questions
+
+Try to answer each question before opening the answer.
+
+<details>
+<summary>1. How is a container different from a virtual machine?</summary>
+
+A container is an isolated process that shares the host's kernel; namespaces limit what it can see and cgroups limit what it can use. A VM runs its own kernel on virtualized hardware. Containers start faster and are lighter, but the kernel is a shared attack surface, so isolation is weaker.
+</details>
+
+<details>
+<summary>2. Why should you deploy by image digest rather than by tag?</summary>
+
+Tags are mutable: `api:1.4` or `latest` can be repointed to different content, so two nodes can run different code under the same tag. A digest identifies exact bytes, so every environment runs what was tested and a rollback returns to exactly the previous image.
+</details>
+
+<details>
+<summary>3. Your container ignores docker stop and is killed after 10 seconds. What is the likely cause?</summary>
+
+The process is not receiving or handling SIGTERM. Usually the Dockerfile uses shell-form `CMD`, so `/bin/sh` is PID 1 and does not forward signals; or the app has no SIGTERM handler. Use exec-form `CMD ["node", "server.js"]` (or an init like `tini`) and handle SIGTERM in the app.
+</details>
+
+<details>
+<summary>4. What is the difference between liveness and readiness probes? What happens if a liveness probe checks the database?</summary>
+
+Readiness failing removes the Pod from Service endpoints but does not restart it. Liveness failing restarts the container. If liveness checks a shared database, a database outage fails liveness on every replica, so Kubernetes restarts all of them at once and makes the outage worse.
+</details>
+
+<details>
+<summary>5. A Pod is stuck in Pending. Walk through how you diagnose it.</summary>
+
+`kubectl describe pod` and read the events. Common causes: no node has enough unreserved CPU or memory for the requests, node selectors or affinity match no node, taints without tolerations, a PVC that cannot bind or whose volume is in another zone, or a namespace quota exceeded.
+</details>
+
+<details>
+<summary>6. What does CrashLoopBackOff mean and what is the first command you run?</summary>
+
+The container keeps exiting and Kubernetes waits longer between each restart. Run `kubectl logs POD --previous` to see the output of the crashed container, then `kubectl describe pod` for the exit code and reason (for example, 137 / OOMKilled).
+</details>
+
+<details>
+<summary>7. What happens when a container hits its CPU limit versus its memory limit?</summary>
+
+At the CPU limit it is throttled and slows down. At the memory limit it is killed (OOMKilled, exit code 137).
+</details>
+
+<details>
+<summary>8. During a rolling update, some requests fail with connection errors even though readiness probes are configured. Why?</summary>
+
+When a Pod is deleted, SIGTERM and endpoint removal happen in parallel. If the app exits immediately, load balancers and kube-proxy may still route requests to it for a short time. Add a short `preStop` sleep and make the app drain in-flight requests before exiting, within `terminationGracePeriodSeconds`.
+</details>
+
+<details>
+<summary>9. Is a Kubernetes Secret encrypted?</summary>
+
+Not by default. Secret values are base64-encoded, which is encoding, not encryption. Protection comes from enabling encryption at rest for etcd, restricting access with RBAC, and often syncing values from an external secret manager.
+</details>
+
+<details>
+<summary>10. What is the difference between port, targetPort, and containerPort?</summary>
+
+`port` is the port the Service listens on. `targetPort` is the port on the Pod that the Service forwards to. `containerPort` documents the port the container listens on; it does not open or expose anything by itself. `targetPort` must match the port the app actually listens on.
+</details>
+
+<details>
+<summary>11. When would you use a StatefulSet instead of a Deployment?</summary>
+
+When each replica needs a stable identity (`db-0`, `db-1`), its own persistent volume that follows it across rescheduling, or ordered startup and shutdown, as databases and Kafka do. Stateless services should use Deployments.
+</details>
+
+<details>
+<summary>12. Three replicas are running, but a single node drain caused downtime. What was missing?</summary>
+
+The replicas were probably on the same node, and nothing limited voluntary disruptions. Add `topologySpreadConstraints` or pod anti-affinity to spread replicas across nodes and zones, and a `PodDisruptionBudget` so a drain keeps a minimum number running.
+</details>
+
+## 23. Master Resource List
 
 ### Docker and OCI
 
@@ -1228,4 +1584,5 @@ For a stuck Pod, check status, events, node capacity, image pull errors, volume 
 | Local Kubernetes clusters | [kind](https://kind.sigs.k8s.io/), [minikube](https://minikube.sigs.k8s.io/docs/) |
 | Kubernetes package manager | [Helm](https://helm.sh/docs/) |
 | Kubernetes configuration management | [Kustomize](https://kustomize.io/) |
-| Kubernetes conformance | [CNCF Kubernetes Conformance](https://www.cncf.io/training/kcna/) |
+| Certifications (hands-on exams) | [CKAD (application developer)](https://www.cncf.io/training/certification/ckad/), [CKA (administrator)](https://www.cncf.io/training/certification/cka/) |
+| kubectl quick reference | [Kubernetes Docs](https://kubernetes.io/docs/reference/kubectl/quick-reference/) |

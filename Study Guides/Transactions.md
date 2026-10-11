@@ -4,7 +4,7 @@ Audience: SDEs who build systems that move money, inventory, credits, or any sta
 Scope: Database transactions (ACID, isolation, locking), money-safe data modeling (double-entry ledgers), idempotency, distributed transactions (2PC, sagas, outbox), payment-provider integration, scaling to millions of users, and the frontend UX that keeps users from creating duplicate or "lost" transactions.
 Last reviewed: 2026-10-12. Examples use PostgreSQL, Node.js/TypeScript, and React. Database and vendor behavior changes between versions; confirm details in the linked documentation before relying on them.
 
-Related guides: [APIs](./APIs.md) (idempotency, webhooks, status codes), [Caching Techniques](./CachingTechniques.md) (consistency and staleness), [Backend Optimization](./BackendOptmization.md) (connection pools, query plans), [Frontend](./Frontend.md), [Testing Framework](./TestingFramework.md), and [Authentication Concepts](./AuthenticationConcepts.md) (step-up auth, authorization).
+Related guides: [APIs](./APIs.md) (idempotency, webhooks, status codes), [Caching Techniques](./CachingTechniques.md) (consistency and staleness), [Backend Optimization](./BackendOptimization.md) (connection pools, query plans), [Frontend](./Frontend.md), [Testing Framework](./TestingFramework.md), and [Authentication Concepts](./AuthenticationConcepts.md) (step-up auth, authorization).
 
 The word **transaction** has two meanings in this guide:
 
@@ -1392,7 +1392,7 @@ CREATE TABLE ledger_entries_2026_10 PARTITION OF ledger_entries
 - Benefits: smaller indexes for recent data, fast drop/archive of old data, vacuum per partition.
 - Queries must include the partition key (`created_at`) to prune partitions. Statement queries by `account_id` alone scan all partitions' indexes; always bound them by date range.
 
-**Other levers** (see [Backend Optimization](./BackendOptmization.md)): covering indexes for hot queries, `EXPLAIN (ANALYZE, BUFFERS)`, autovacuum tuning on high-churn tables (`accounts`, `outbox`), `synchronous_commit` + synchronous replicas for durability across a node failure (costs latency), and batching inserts.
+**Other levers** (see [Backend Optimization](./BackendOptimization.md)): covering indexes for hot queries, `EXPLAIN (ANALYZE, BUFFERS)`, autovacuum tuning on high-churn tables (`accounts`, `outbox`), `synchronous_commit` + synchronous replicas for durability across a node failure (costs latency), and batching inserts.
 
 ### Production pitfalls
 
@@ -1414,7 +1414,7 @@ CREATE TABLE ledger_entries_2026_10 PARTITION OF ledger_entries
 - PostgreSQL table partitioning — https://www.postgresql.org/docs/current/ddl-partitioning.html
 - pg_partman — https://github.com/pgpartman/pg_partman
 - PostgreSQL high availability and replication — https://www.postgresql.org/docs/current/high-availability.html
-- See also: [Backend Optimization, Connection Pooling](./BackendOptmization.md)
+- See also: [Backend Optimization, Connection Pooling](./BackendOptimization.md)
 
 ---
 
